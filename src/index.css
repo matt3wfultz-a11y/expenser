@@ -563,3 +563,19 @@ table.summary tr.part td:nth-child(2) {
     max-width: none;
   }
 }
+
+tr.excluded td {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+tr.excluded td.check {
+  text-decoration: none;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

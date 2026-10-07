@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { type ColumnMapping, type CsvTable, type ParsedRow, type SignConvention, detectColumns, readCsv, toRows } from '../lib/csv'
 import { countDuplicates, deleteImport, importRows } from '../lib/db'
+import { extractPdfLines, PdfTextError } from '../lib/pdfText'
+import { parseStatementLines } from '../lib/statement'
 import type { ImportRecord, Transaction } from '../lib/types'
 import { money, plural } from '../format'
 
@@ -11,11 +13,17 @@ interface Pending {
   mapping: ColumnMapping
   sign: SignConvention
   account: string
+  /** Set for PDF statements: the extracted text, re-parsed when the year changes. */
+  pdf?: { lines: string[]; year: number | null; usedYear: boolean }
 }
 
 interface Props {
   imports: ImportRecord[]
   transactions: Transaction[]
+}
+
+function isPdf(file: File): boolean {
+  return file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
 }
 
 function accountFromFileName(name: string): string {
@@ -42,18 +50,31 @@ export function ImportView({ imports, transactions }: Props) {
     const added: Pending[] = []
     for (const file of files) {
       try {
-        const table = readCsv(await file.text())
-        if (!table.headers.length || !table.rows.length) throw new Error('no rows found')
-        added.push({
-          key: `${file.name}-${crypto.randomUUID()}`,
-          fileName: file.name,
-          table,
-          mapping: detectColumns(table.headers),
-          sign: 'auto',
-          account: accountFromFileName(file.name),
-        })
+        const base = { key: `${file.name}-${crypto.randomUUID()}`, fileName: file.name, account: accountFromFileName(file.name) }
+        if (isPdf(file)) {
+          const lines = await extractPdfLines(await file.arrayBuffer())
+          const result = parseStatementLines(lines)
+          if (!result.table.rows.length) {
+            throw new Error(
+              'no transactions were recognized in this PDF. Lines need to start with a date and end with an amount. Try the CSV download from your bank instead.',
+            )
+          }
+          added.push({
+            ...base,
+            table: result.table,
+            mapping: detectColumns(result.table.headers),
+            // Running balances give bank-style signs (money out negative).
+            sign: result.signedFromBalance ? 'negative-is-expense' : 'auto',
+            pdf: { lines, year: result.guessedYear, usedYear: result.usedYear },
+          })
+        } else {
+          const table = readCsv(await file.text())
+          if (!table.headers.length || !table.rows.length) throw new Error('no rows found')
+          added.push({ ...base, table, mapping: detectColumns(table.headers), sign: 'auto' })
+        }
       } catch (e) {
-        setError(`Could not read ${file.name}: ${e instanceof Error ? e.message : String(e)}`)
+        const reason = e instanceof PdfTextError ? e.message : `Could not read it: ${e instanceof Error ? e.message : String(e)}`
+        setError(`${file.name}: ${reason}`)
       }
     }
     setPending((p) => [...p, ...added])
@@ -77,9 +98,9 @@ export function ImportView({ imports, transactions }: Props) {
 
   return (
     <section>
-      <h2>Import a CSV</h2>
+      <h2>Import transactions</h2>
       <p className="muted">
-        Download transactions from your bank or card as CSV, then add them here. Files are read in your browser and never
+        Download transactions from your bank or card as CSV (best) or a PDF statement, then add them here. Files are read in your browser and never
         uploaded anywhere.
       </p>
 
@@ -96,7 +117,7 @@ export function ImportView({ imports, transactions }: Props) {
           void addFiles(e.dataTransfer.files)
         }}
       >
-        <p>Drop CSV files here, or</p>
+        <p>Drop CSV or PDF files here, or</p>
         <div className="row">
           <button className="primary" onClick={() => input.current?.click()}>
             Choose files…
@@ -106,7 +127,7 @@ export function ImportView({ imports, transactions }: Props) {
         <input
           ref={input}
           type="file"
-          accept=".csv,text/csv,.txt"
+          accept=".csv,text/csv,.txt,.pdf,application/pdf"
           multiple
           hidden
           onChange={(e) => {
@@ -191,6 +212,14 @@ interface CardProps {
 function PendingCard({ pending, onChange, onCancel, onDone }: CardProps) {
   const { table, mapping, sign, account } = pending
   const result = useMemo(() => toRows(table, mapping, sign), [table, mapping, sign])
+  // Rows unticked in the preview, for this exact parse (any change re-includes everything).
+  const [exclusion, setExclusion] = useState<{ rows: ParsedRow[]; skip: Set<number> } | null>(null)
+  const skip = useMemo(
+    () => (exclusion?.rows === result.rows ? exclusion.skip : new Set<number>()),
+    [exclusion, result.rows],
+  )
+  const included = useMemo(() => result.rows.filter((_, i) => !skip.has(i)), [result.rows, skip])
+  const [showAll, setShowAll] = useState(false)
   const [dupCheck, setDupCheck] = useState<{ rows: ParsedRow[]; account: string; n: number } | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -207,23 +236,23 @@ function PendingCard({ pending, onChange, onCancel, onDone }: CardProps) {
 
   useEffect(() => {
     let live = true
-    countDuplicates(result.rows, account).then((n) => live && setDupCheck({ rows: result.rows, account, n }))
+    countDuplicates(included, account).then((n) => live && setDupCheck({ rows: included, account, n }))
     return () => {
       live = false
     }
-  }, [result.rows, account])
+  }, [included, account])
   // Null while the check for the current rows and account is still running.
-  const duplicates = dupCheck && dupCheck.rows === result.rows && dupCheck.account === account ? dupCheck.n : null
+  const duplicates = dupCheck && dupCheck.rows === included && dupCheck.account === account ? dupCheck.n : null
 
-  const fresh = duplicates === null ? null : result.rows.length - duplicates
-  const totalOut = result.rows.reduce((s, r) => s + (r.amount > 0 ? r.amount : 0), 0)
-  const totalIn = result.rows.reduce((s, r) => s + (r.amount < 0 ? -r.amount : 0), 0)
+  const fresh = duplicates === null ? null : included.length - duplicates
+  const totalOut = included.reduce((s, r) => s + (r.amount > 0 ? r.amount : 0), 0)
+  const totalIn = included.reduce((s, r) => s + (r.amount < 0 ? -r.amount : 0), 0)
 
   async function doImport() {
     setBusy(true)
     setError(null)
     try {
-      const rec = await importRows(pending.fileName, account.trim() || 'Account', result.rows)
+      const rec = await importRows(pending.fileName, account.trim() || 'Account', included)
       // Ask the browser not to evict our data under storage pressure.
       void navigator.storage?.persist?.()
       onDone(
@@ -269,9 +298,26 @@ function PendingCard({ pending, onChange, onCancel, onDone }: CardProps) {
           <input list="accounts" value={account} onChange={(e) => onChange({ account: e.target.value })} />
           <small className="muted">Use the same name each time for the same card so duplicates are caught.</small>
         </label>
-        {columnSelect('date', 'Date column')}
-        {columnSelect('description', 'Description column')}
-        {columnSelect('amount', 'Amount column')}
+        {pending.pdf?.usedYear && (
+          <label>
+            Statement year
+            <input
+              type="number"
+              min={1990}
+              max={2100}
+              value={pending.pdf.year ?? ''}
+              onChange={(e) => {
+                const year = e.target.value ? Number(e.target.value) : null
+                const pdf = { ...pending.pdf!, year }
+                onChange({ pdf, table: parseStatementLines(pdf.lines, year ?? undefined).table })
+              }}
+            />
+            <small className="muted">Dates on this statement have no year. December dates on a January statement use the year before.</small>
+          </label>
+        )}
+        {!pending.pdf && columnSelect('date', 'Date column')}
+        {!pending.pdf && columnSelect('description', 'Description column')}
+        {!pending.pdf && columnSelect('amount', 'Amount column')}
         {mapping.amount === null && columnSelect('debit', 'Debit (money out) column')}
         {mapping.amount === null && columnSelect('credit', 'Credit (money in) column')}
         {!usesDebitCredit && (
@@ -296,7 +342,7 @@ function PendingCard({ pending, onChange, onCancel, onDone }: CardProps) {
       ) : (
         <>
           <p className="muted">
-            Preview: {money(totalOut)} spent, {money(totalIn)} received across {plural(result.rows.length, 'row')}.
+            Preview: {money(totalOut)} spent, {money(totalIn)} received across {plural(included.length, 'row')}.
             {result.skipped > 0 && ` ${plural(result.skipped, 'row')} without an amount will be skipped.`}
             {duplicates !== null && duplicates > 0 && ` ${plural(duplicates, 'row')} already imported for this account will be skipped.`}
           </p>
@@ -304,14 +350,30 @@ function PendingCard({ pending, onChange, onCancel, onDone }: CardProps) {
             <table className="compact">
               <thead>
                 <tr>
+                  <th className="check" title="Include">
+                    <span className="sr-only">Include</span>
+                  </th>
                   <th>Date</th>
                   <th>Description</th>
                   <th className="num">Spent</th>
                 </tr>
               </thead>
               <tbody>
-                {result.rows.slice(0, 6).map((r, i) => (
-                  <tr key={i}>
+                {result.rows.slice(0, showAll ? undefined : 6).map((r, i) => (
+                  <tr key={i} className={skip.has(i) ? 'excluded' : ''}>
+                    <td className="check">
+                      <input
+                        type="checkbox"
+                        checked={!skip.has(i)}
+                        aria-label={`Include ${r.description}`}
+                        onChange={() => {
+                          const next = new Set(skip)
+                          if (next.has(i)) next.delete(i)
+                          else next.add(i)
+                          setExclusion({ rows: result.rows, skip: next })
+                        }}
+                      />
+                    </td>
                     <td>{r.date}</td>
                     <td>{r.description}</td>
                     <td className={`num${r.amount < 0 ? ' credit' : ''}`}>{money(r.amount)}</td>
@@ -320,7 +382,16 @@ function PendingCard({ pending, onChange, onCancel, onDone }: CardProps) {
               </tbody>
             </table>
           </div>
-          <p className="muted small">If spending shows as negative here, switch the "Amount signs" setting.</p>
+          {result.rows.length > 6 && (
+            <button className="link small" onClick={() => setShowAll(!showAll)}>
+              {showAll ? 'Show fewer rows' : `Show all ${result.rows.length.toLocaleString()} rows`}
+            </button>
+          )}
+          <p className="muted small">
+            {pending.pdf &&
+              'Read from the PDF text: compare these rows with your statement, and untick anything that is not a transaction. '}
+            If spending shows as negative here, switch the "Amount signs" setting.
+          </p>
         </>
       )}
 

@@ -16,6 +16,14 @@ never uploaded anywhere, including GitHub.
   shows as negative or positive, and lets you correct anything it got wrong
   before importing. Re-importing an overlapping export skips rows you already
   have.
+- **Imports PDF statements** too, read in the browser with pdf.js. It picks
+  out lines that start with a date and end with an amount, fills in the year
+  when the statement leaves it out (December dates on a January statement go
+  to the previous year), and uses running balances to tell deposits from
+  withdrawals. Every row is shown before import so you can untick anything
+  that isn't a transaction. Scanned (image-only) PDFs have no text to read;
+  use the bank's CSV download for those. CSV is still the most reliable
+  format.
 - **Built-in tax categories:**
   - Schedule C (business expenses), lines 8–30 plus cost of goods sold, with
     meals at 50%.
@@ -38,7 +46,7 @@ never uploaded anywhere, including GitHub.
 
 ## Using it
 
-1. Download transactions as CSV from your bank or card's website.
+1. Download transactions as CSV (or a PDF statement) from your bank or card's website.
 2. **Import**: drop the files in, check the preview, and click Import. Use the
    same account name each time for the same card so duplicates are caught.
    Click "Try sample data" to try it out without real data.
@@ -83,6 +91,7 @@ npm run preview   # serve the production build
 | Path | What's there |
 | --- | --- |
 | `src/lib/csv.ts` | CSV reading, column detection, amount/date parsing, sign handling |
+| `src/lib/pdfText.ts`, `src/lib/statement.ts` | PDF text extraction and statement-line parsing |
 | `src/lib/taxCategories.ts` | Built-in Schedule C / Schedule A categories and keywords |
 | `src/lib/suggest.ts` | Merchant normalization and suggestions (past picks, then keywords) |
 | `src/lib/db.ts` | IndexedDB storage (Dexie): import with de-duplication, categorizing, backup |
